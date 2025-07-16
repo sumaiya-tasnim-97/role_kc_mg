@@ -90,7 +90,7 @@ for dcd_file in dcd_files:
     traj.superpose(reference,atom_indices=nuc_atoms)
     rmsd = md.rmsd(traj, reference, atom_indices=nuc_atoms) * 10  # Å
 # Your timestep is 2 fs per frame → convert to microseconds (µs)
-    time_us = np.arange(len(traj)) * 2e-6  # 2 fs = 2e-6 µs
+    time_us = np.arange(len(traj)) * 2e-9  # 2 fs = 2e-9 µs
 
     label = os.path.splitext(os.path.basename(dcd_file))[0]
     plt.plot(time_us, rmsd, label=label)
