@@ -30,6 +30,8 @@ or multimeric RNA complexes from monomer units. It performs the following key op
 Used after generating a flipped or rotated copy of an RNA monomer (e.g., `monomer_with_flipped.pdb`)
 to produce a cleanly indexed and properly formatted dimer: `combined_shifted.pdb`.
 
+
+This gives an erronous pdb. run fix_pdb_2.py after this. gets it correct.
 """
 
 
