@@ -1,52 +1,43 @@
 """
-Universal post-processing for Targeted Molecular Dynamics (TMD) trajectories
-to estimate a Potential of Mean Force (PMF) along a user-chosen 1D coordinate
-(default: RMSD) and compute multiple binding free-energy (ΔG_bind) estimates.
+Post-processing script for Targeted Molecular Dynamics (TMD) trajectories
+to estimate a Potential of Mean Force (PMF) along RMSD and compute several
+binding free energy (ΔG_bind) estimates.
 
-You can adapt this to any system by editing the CONFIG block below. The core
-logic (parsing, work integration, interpolation, Jarzynski averaging,
-ΔG estimators, plotting) is unchanged.
+Pipeline:
+1) Parse TMD log files for step, RMSD, and restraint deviation.
+2) Compute trajectory-wise work profiles under a harmonic bias.
+3) Interpolate all profiles onto a common RMSD grid and smooth them.
+4) Apply Jarzynski’s equality across trajectories to obtain PMF vs RMSD.
+5) Compute ΔG_bind using several definitions and a standard-state correction.
+6) Identify the trajectory most similar to the PMF endpoint.
+7) Plot work traces, PMF curves, and uncertainty bands.
+
+Assumptions (only these are user-configurable):
+- Files and glob pattern for logs.
+- Log parsing: which columns hold step, target, current.
+- Thermo/forcefield: temperature and spring constant.
+
+All other analysis choices (grid limits, unbound region, axis direction, shading)
+are inferred from the data and the smoothed PMF.
 """
 
-# ============================ CONFIG (edit me) ============================
+# ===================== USER-CONFIGURABLE (ONLY) =====================
 
-CONFIG = {
-    # Files
-    "LOG_GLOB": "*.log",          # Glob pattern for TMD logs
+# Files
+LOG_GLOB = "*.log"            # Pattern for input logs
 
-    # Reaction coordinate grid (direction preserved; only endpoints change)
-    "GRID_START": 12.5,            # coordinate value at index 0
-    "GRID_END": 1.5,               # coordinate value at index -1
-    "GRID_NPTS": 500,              # number of grid points
+# Log parsing
+LINE_PREFIX = "TMD"           # Lines to parse start with this
+STEP_COL    = 1               # Column index for step (0-based)
+TARGET_COL  = 4               # Column index for target RMSD/coord
+CURRENT_COL = 5               # Column index for current RMSD/coord
 
-    # Temperature & bias
-    "TEMPERATURE_K": 310.0,        # Kelvin
-    "SPRING_K": 40.0,              # kcal/mol/Å^2
+# Thermo/forcefield
+TEMP_K    = 310.0             # Temperature (K)
+K_B       = 0.0019872041      # Boltzmann constant (kcal/mol/K)
+K_SPRING  = 40.0              # Harmonic bias (kcal/mol/Å^2)
 
-    # PMF region definitions for ΔG (purely geometric; tune to your system)
-    "UNBOUND_RANGE": (10.0, 12.0), # tuple defining the unbound window on the grid
-    "BOUND_USE_MIN_POINT": True,   # keep bound = argmin coordinate (matches original logic)
-    "BOUND_SHADE_WIDTH": 0.02,     # visual shading width (in coordinate units) near min
-
-    # Plateau detection (auto "flat" region finder)
-    "PLATEAU_SLOPE_THRESHOLD": 0.1,  # kcal/mol per unit-coordinate
-
-    # Plot cosmetics
-    "COORDINATE_LABEL": r"RMSD ($\AA$)",  # axis label for the coordinate
-    "TITLE": "PMF and ΔG_bind from TMD",
-    "UNBOUND_LABEL": "Putative unbound region",
-    "BOUND_LABEL": "Putative bound region",
-
-    # TMD log parsing — use these if your log format differs.
-    # By default, the code looks for lines starting with 'TMD' and assumes:
-    # parts[1] = step (int), parts[4] = target coordinate, parts[5] = current coordinate
-    "LINE_PREFIX": "TMD",
-    "STEP_COL": 1,
-    "TARGET_COL": 4,
-    "CURRENT_COL": 5,
-}
-
-# ======================== END CONFIG (logic below) ========================
+# ====================================================================
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -55,64 +46,42 @@ from scipy.interpolate import interp1d
 from scipy.signal import savgol_filter
 
 
-def read_tmd_log(logfile, *,
-                 line_prefix=CONFIG["LINE_PREFIX"],
-                 step_col=CONFIG["STEP_COL"],
-                 target_col=CONFIG["TARGET_COL"],
-                 current_col=CONFIG["CURRENT_COL"]):
+def read_tmd_log(logfile):
     """
-    Parse a TMD log file to extract simulation steps, current coordinate (e.g., RMSD),
-    and restraint deviation (target - current).
-
-    Parameters
-    ----------
-    logfile : str
-        Path to a single TMD log file.
-    line_prefix : str
-        Prefix that marks lines containing TMD fields (default: 'TMD').
-    step_col : int
-        Zero-based index of the 'step' token in line split.
-    target_col : int
-        Zero-based index of the 'target coordinate' token.
-    current_col : int
-        Zero-based index of the 'current coordinate' token.
-
-    Returns
-    -------
-    steps : np.ndarray
-    coords : np.ndarray
-    forces : np.ndarray
+    Parse a TMD log file to extract simulation steps, current RMSD, and
+    restraint deviation (target RMSD - current RMSD).
     """
-    steps, coords, forces = [], [], []
+    steps, rmsds, forces = [], [], []
     with open(logfile, 'r') as f:
         for line in f:
-            if line.startswith(line_prefix):
+            if line.startswith(LINE_PREFIX):
                 try:
                     parts = line.strip().split()
-                    step = int(parts[step_col])
-                    target_val = float(parts[target_col])
-                    current_val = float(parts[current_col])
-                    force = target_val - current_val
+                    step = int(parts[STEP_COL])
+                    target_rmsd = float(parts[TARGET_COL])
+                    current_rmsd = float(parts[CURRENT_COL])
+                    force = target_rmsd - current_rmsd
                     steps.append(step)
-                    coords.append(current_val)
+                    rmsds.append(current_rmsd)
                     forces.append(force)
                 except Exception as e:
                     print(f"⚠️ Error in {logfile}: {line.strip()}\n{e}")
-    return np.array(steps), np.array(coords), np.array(forces)
+    return np.array(steps), np.array(rmsds), np.array(forces)
 
 
-def compute_work(forces, k, dcoord):
+def compute_work(forces, k, drmsd):
     """
-    Integrate the work profile along the coordinate under a harmonic bias.
-    Work = -0.5 * k * Σ [ (force)^2 * Δcoord ]
+    Integrate the work profile along RMSD for a trajectory under a harmonic bias.
+    Work = -0.5 * k * Σ [ (force)^2 * ΔRMSD ]
     """
-    return -0.5 * k * np.cumsum(forces**2 * dcoord)
+    return -0.5 * k * np.cumsum(forces**2 * drmsd)
 
 
 def jarzynski_equality(work, kT):
     """
-    Apply Jarzynski’s equality to an ensemble of work profiles at each grid point.
-    F = -kT * ln <exp(-(W - Wmin)/kT)> + Wmin
+    Apply Jarzynski’s equality to an ensemble of work profiles to estimate
+    free energy change as a function of RMSD.
+    F(R) = -kT * ln ⟨ exp( -[ W_i(R) - Wmin(R) ] / kT ) ⟩ + Wmin(R)
     """
     work_min = np.min(work, axis=1, keepdims=True)
     exp_factor = np.exp(-(work - work_min) / kT)
@@ -122,7 +91,7 @@ def jarzynski_equality(work, kT):
 
 def smooth(y, window=11, poly=3):
     """
-    Savitzky–Golay smoothing with guards for short arrays / small windows.
+    Apply Savitzky–Golay smoothing to a curve.
     """
     if len(y) < window:
         window = len(y) - (1 - len(y) % 2)
@@ -134,7 +103,7 @@ def smooth(y, window=11, poly=3):
 def bootstrap_dg(pmf, distances, bound_mask, unbound_mask, n_boot=1000, seed=42):
     """
     Bootstrap ΔG between bound and unbound regions by resampling PMF points.
-    (Resamples grid points, not trajectories.)
+    (Resamples grid points; not trajectories.)
     """
     rng = np.random.default_rng(seed)
     dg_vals = []
@@ -147,8 +116,7 @@ def bootstrap_dg(pmf, distances, bound_mask, unbound_mask, n_boot=1000, seed=42)
 
 def standard_state_correction(temp_K):
     """
-    Standard-state (1 M) correction to convert a PMF well depth to ΔG°.
-    ΔG° = RT ln(1660)  (with volume in Å^3)
+    Standard state correction for 1 M binding free energy from a PMF well depth.
     """
     R = 1.9872041e-3  # kcal/mol·K
     return -R * temp_K * np.log(1 / 1660)
@@ -164,95 +132,134 @@ def find_closest_file(pmf, work, filenames):
     return filenames[closest_index]
 
 
+def infer_grid_bounds(all_rmsd_lists, npts=500):
+    """
+    Infer a common coordinate grid from the pooled RMSD across all logs.
+    Returns a decreasing grid (max → min) to keep original plotting orientation.
+    """
+    rmin = min(float(np.min(x)) for x in all_rmsd_lists if len(x) > 0)
+    rmax = max(float(np.max(x)) for x in all_rmsd_lists if len(x) > 0)
+    # tiny padding to avoid extrapolation issues at boundaries
+    pad = 0.01 * (rmax - rmin) if rmax > rmin else 0.0
+    start, end = rmax + pad, rmin - pad
+    return np.linspace(start, end, npts)
+
+
+def masks_from_pmf(distances, pmf_smooth, slope_thresh=0.1):
+    """
+    Build bound/unbound masks from the *smoothed* PMF:
+      - Bound: the minimum coordinate (keeps original logic)
+      - Unbound: from the first 'flat' index (|dF/dR| < thresh) out to the edge
+                 of the grid on the high-coordinate side.
+    """
+    # gradient on the native grid
+    grad = np.abs(np.gradient(pmf_smooth, distances))
+    flat = np.where(grad < slope_thresh)[0]
+    if flat.size > 0:
+        plateau_start_index = int(flat[0])
+    else:
+        # fallback: use last 15% of grid as 'unbound' if flatness not detected
+        plateau_start_index = max(0, int(0.85 * len(distances)))
+
+    # Bound mask = min coordinate (unchanged from original code)
+    bound_mask = distances == np.min(distances)
+
+    # Unbound mask: include the high-coordinate side from plateau start to the edge.
+    # Because 'distances' is decreasing (max→min), high-coordinate side is indices <= plateau_start_index.
+    unbound_mask = np.zeros_like(distances, dtype=bool)
+    unbound_mask[:plateau_start_index + 1] = True
+
+    return bound_mask, unbound_mask, plateau_start_index
+
+
 def main():
-    # === Parameters from CONFIG ===
-    k = float(CONFIG["SPRING_K"])
-    T = float(CONFIG["TEMPERATURE_K"])
-    kB = 0.0019872041
-    kT = kB * T
-    grid_start = float(CONFIG["GRID_START"])
-    grid_end = float(CONFIG["GRID_END"])
-    npts = int(CONFIG["GRID_NPTS"])
-    unbound_lo, unbound_hi = CONFIG["UNBOUND_RANGE"]
-    slope_thresh = float(CONFIG["PLATEAU_SLOPE_THRESHOLD"])
+    k = K_SPRING
+    T = TEMP_K
+    kT = K_B * T
 
-    # Common coordinate grid (direction preserved)
-    coord_uniform = np.linspace(grid_start, grid_end, npts)
-
-    # === Collect log files ===
-    logfiles = sorted(glob.glob(CONFIG["LOG_GLOB"]))
+    # -------- PASS 1: read all logs and collect RMSD/force arrays --------
+    logfiles = sorted(glob.glob(LOG_GLOB))
     if not logfiles:
         print("❌ No log files found.")
         return
 
-    all_work_interp, smooth_work = [], []
-
-    # === Process each trajectory ===
+    parsed = []  # list of (steps, rmsds, forces)
     for logfile in logfiles:
-        steps, coords, forces = read_tmd_log(logfile)
-        if len(coords) == 0:
+        steps, rmsds, forces = read_tmd_log(logfile)
+        if len(rmsds) == 0:
             continue
-        dcoord = np.gradient(coords)
-        work = compute_work(forces, k, dcoord)
+        parsed.append((steps, rmsds, forces))
+
+    if not parsed:
+        print("❌ No usable data in logs.")
+        return
+
+    # Infer grid from all observed RMSDs (max→min to keep original orientation)
+    rmsd_uniform = infer_grid_bounds([r for (_, r, _) in parsed], npts=500)
+
+    # -------- PASS 2: compute work, interpolate, smooth --------
+    all_work_interp = []
+    smooth_work = []
+
+    for (steps, rmsds, forces) in parsed:
+        drmsd = np.gradient(rmsds)
+        work = compute_work(forces, k, drmsd)
 
         try:
-            interp_func = interp1d(coords, work, bounds_error=False, fill_value="extrapolate")
-            work_interp = interp_func(coord_uniform)
+            interp_func = interp1d(rmsds, work, bounds_error=False, fill_value="extrapolate")
+            work_interp = interp_func(rmsd_uniform)
             all_work_interp.append(work_interp)
             smooth_work.append(smooth(work_interp, window=11, poly=3))
         except Exception as e:
-            print(f"⚠️ Interpolation failed for {logfile}: {e}")
+            print(f"⚠️ Interpolation failed for a trajectory: {e}")
 
     if not all_work_interp:
         print("❌ No usable work data.")
         return
 
-    # Arrays: shape (n_points, n_traj)
-    all_work_interp = np.array(all_work_interp).T
+    all_work_interp = np.array(all_work_interp).T   # shape (n_points, n_traj)
     smooth_work = np.array(smooth_work).T
 
-    # === Jarzynski PMFs ===
+    # -------- Jarzynski PMFs (unchanged logic) --------
     pmf_raw = jarzynski_equality(all_work_interp, kT)
     pmf_smooth = smooth(pmf_raw, window=11, poly=3)
     pmf_w_smooth = jarzynski_equality(smooth_work, kT)
 
-    # Simple spread proxy (SEM of work profiles; not a Jarzynski CI)
+    # simple spread proxy (SEM across trajectories of interpolated work)
     pmf_std = np.std(all_work_interp, axis=1) / np.sqrt(all_work_interp.shape[1])
 
-    # === ΔG_bind region masks (universal, configurable) ===
-    distances = coord_uniform
-    # Bound region: minimum coordinate point (matches original logic)
-    bound_mask = distances == np.min(distances) if CONFIG["BOUND_USE_MIN_POINT"] else distances == distances[0]
-    # Unbound region: configurable window
-    unbound_mask = (distances > unbound_lo) & (distances < unbound_hi)
+    # -------- Build masks/data-driven regions from *smoothed* PMF --------
+    distances = rmsd_uniform
 
-    # === Plateau detection (auto) ===
-    grad = np.abs(np.gradient(pmf_smooth, distances))
-    plateau_start_index = np.argmax(grad < slope_thresh)
-    dg_auto_plateau = pmf_smooth[plateau_start_index] - np.min(pmf_smooth)
+    bound_mask, unbound_mask, plateau_start_index = masks_from_pmf(
+        distances, pmf_smooth, slope_thresh=0.1
+    )
 
+    # For the second PMF (from smoothed work), we also detect plateau to report its ΔG
     grad2 = np.abs(np.gradient(pmf_w_smooth, distances))
-    plateau_start_index2 = np.argmax(grad2 < slope_thresh)
-    dg_auto_plateau_2 = pmf_w_smooth[plateau_start_index2] - np.min(pmf_w_smooth)
+    flat2 = np.where(grad2 < 0.1)[0]
+    plateau_start_index_2 = int(flat2[0]) if flat2.size > 0 else max(0, int(0.85 * len(distances)))
 
-    # === ΔG_bind estimators (same logic, reported twice for both PMFs) ===
+    # -------- ΔG estimators (identical formulas) --------
+    dg_auto_plateau = pmf_smooth[plateau_start_index] - np.min(pmf_smooth)
     dg_pointwise = pmf_smooth[-1] - np.min(pmf_smooth)
     dg_avg = np.mean(pmf_smooth[unbound_mask]) - np.mean(pmf_smooth[bound_mask])
     dg_maxmin = np.max(pmf_smooth) - np.min(pmf_smooth)
     dg_boot_mean, dg_boot_std = bootstrap_dg(pmf_smooth, distances, bound_mask, unbound_mask)
     dg_std_corr = standard_state_correction(T)
 
+    dg_auto_plateau_2 = pmf_w_smooth[plateau_start_index_2] - np.min(pmf_w_smooth)
     dg_pointwise_2 = pmf_w_smooth[-1] - np.min(pmf_w_smooth)
     dg_avg_2 = np.mean(pmf_w_smooth[unbound_mask]) - np.mean(pmf_w_smooth[bound_mask])
     dg_maxmin_2 = np.max(pmf_w_smooth) - np.min(pmf_w_smooth)
     dg_boot_mean_2, dg_boot_std_2 = bootstrap_dg(pmf_w_smooth, distances, bound_mask, unbound_mask)
     dg_std_corr_2 = standard_state_correction(T)
 
-    # === Identify closest-matching trajectory ===
-    closest_file = find_closest_file(pmf_raw, all_work_interp, logfiles)
+    # -------- Identify closest-matching trajectory (unchanged) --------
+    closest_file = find_closest_file(pmf_raw, all_work_interp, [lf for lf in logfiles if True])
     print(f"\n🔍 Closest trajectory to PMF (final value): {closest_file}")
 
-    # === Final ΔG output ===
+    # -------- Final ΔG output (unchanged headings & order) --------
     print("\n===== Estimated Binding Free Energy from PMF =====")
     print(f"1. Pointwise ΔG_bind (plateau - min):       {dg_pointwise:.2f} kcal/mol")
     print(f"2. Region-averaged ΔG_bind:                 {dg_avg:.2f} kcal/mol")
@@ -261,8 +268,8 @@ def main():
     print(f"5. Standard-state correction (1 M):         {dg_std_corr:.2f} kcal/mol")
     print(f"6. ΔG_bind corrected to standard state:     {(dg_avg + dg_std_corr):.2f} kcal/mol")
     print(f"7. Detect plateau automatically:            {dg_auto_plateau:.2f} kcal/mol")
-
-    print("\n===== Estimated Binding Free Energy from PMF (Smoothed Work) =====")
+    
+    print("\n===== Estimated Binding Free Energy from PMF =====")
     print(f"1. Pointwise ΔG_bind (plateau - min):       {dg_pointwise_2:.2f} kcal/mol")
     print(f"2. Region-averaged ΔG_bind:                 {dg_avg_2:.2f} kcal/mol")
     print(f"3. Max - Min PMF range:                     {dg_maxmin_2:.2f} kcal/mol")
@@ -271,43 +278,48 @@ def main():
     print(f"6. ΔG_bind corrected to standard state:     {(dg_avg_2 + dg_std_corr_2):.2f} kcal/mol")
     print(f"7. Detect plateau automatically:            {dg_auto_plateau_2:.2f} kcal/mol")
 
-    # === Plot ===
+    # -------- Plot (regions & axis direction inferred) --------
     plt.figure(figsize=(8, 6))
 
-    # Show smoothed work traces for context
+    # All smoothed work traces (context)
     for i in range(smooth_work.shape[1]):
         plt.plot(distances, smooth_work[:, i], color='gray', alpha=0.2)
 
     # PMF curves
     plt.plot(distances, pmf_raw, label="Raw PMF", color='orange', linewidth=2)
     plt.plot(distances, pmf_smooth, label="Smoothed PMF", color='blue', linewidth=2)
-    plt.plot(distances, pmf_w_smooth, label="Smoothed-Work PMF", color='yellow', linewidth=2)
+    plt.plot(distances, pmf_w_smooth, label="Smoothed W PMF", color='yellow', linewidth=2)
 
     # Shaded variability band (SEM of work profiles)
     plt.fill_between(distances, pmf_smooth - pmf_std, pmf_smooth + pmf_std,
-                     color='blue', alpha=0.2, label="Std. deviation (work SEM)")
+                     color='blue', alpha=0.2, label="Std. deviation")
 
-    # Highlight unbound region
-    plt.axvspan(unbound_lo, unbound_hi, color='green', alpha=0.1,
-                label=CONFIG["UNBOUND_LABEL"])
+    # Inferred unbound region shading (from plateau start to high-coordinate edge)
+    x_left = distances[0]
+    x_plateau = distances[plateau_start_index]
+    # ensure proper left/right bounds for axvspan regardless of direction
+    plt.axvspan(min(x_left, x_plateau), max(x_left, x_plateau),
+                color='green', alpha=0.1, label='Unbound region')
 
-    # Highlight a thin bound region near the minimum coordinate for visualization
-    bound_min = np.min(distances)
-    plt.axvspan(bound_min, bound_min + CONFIG["BOUND_SHADE_WIDTH"],
-                color='red', alpha=0.1, label=CONFIG["BOUND_LABEL"])
+    # Inferred bound region shading: a thin window near the minimum coordinate
+    xmin = np.min(distances); xmax = np.max(distances)
+    span = abs(xmax - xmin)
+    bound_width = max(1e-6, 0.02 * span)  # ~2% of range
+    plt.axvspan(xmin, xmin + bound_width, color='red', alpha=0.1, label='Bound region')
 
-    # Overlay closest trajectory (diagnostic)
-    closest_idx = logfiles.index(closest_file)
+    # Overlay closest trajectory
+    # Map filename to column index (assumes logfiles order matched; safe if no filtering)
+    closest_idx = logfiles.index(closest_file) if closest_file in logfiles else 0
     plt.plot(distances, all_work_interp[:, closest_idx], color='black',
              linewidth=2, label='Closest trajectory')
 
-    # Direction of coordinate as configured by GRID_START→GRID_END
+    # Keep original visual convention: large RMSD on the left, small on the right
     if distances[0] > distances[-1]:
         plt.gca().invert_xaxis()
 
-    plt.xlabel(CONFIG["COORDINATE_LABEL"], fontsize=16)
+    plt.xlabel(r"RMSDs ($\AA$)", fontsize=16)
     plt.ylabel("Energy (kcal/mol)", fontsize=16)
-    plt.title(CONFIG["TITLE"], fontsize=18)
+    plt.title("PMF and ΔG_bind from TMD", fontsize=18)
     plt.legend()
     plt.tight_layout()
     plt.show()
